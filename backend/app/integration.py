@@ -21,9 +21,11 @@ from app.models import (
     AntiBlockStrategy, AntiType, ArchiveFormat, ArchivePolicy, CleanedContent,
     CleanRule, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
     DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
-    ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
-    SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
+    ProxyNode, QualitySample, RawExtractedContent, RuleReleaseReceipt,
+    SampleMethod, SchedulePlan, SiteConfig, SiteType, StorageBatch,
+    UrlFingerprint, schema_fingerprint,
 )
+from app import release_flow
 from app.store import store
 
 
@@ -54,6 +56,7 @@ def run_crawl_pipeline(site_row: dict[str, Any], job_row: dict[str, Any],
         rules = [ExtractRule.from_seed_row(extract_rows[0])] if extract_rows else []
     extracted_contents: list[RawExtractedContent] = []
     parse_logs: list[ParseLogEntry] = []
+    receipts_by_rule = _release_receipts_for_rules(rules)
 
     for i, url in enumerate(job.entry_urls):
         rule = rules[i % len(rules)] if rules else None
@@ -62,7 +65,9 @@ def run_crawl_pipeline(site_row: dict[str, Any], job_row: dict[str, Any],
         raw = _simulate_extract(url, rule)
         extracted_contents.append(raw)
 
-        # 记录解析日志（parse_log）
+        # 记录解析日志（parse_log）：登记实际使用的规则版本与发布回执；
+        # 没有发布回执的规则属于旧链路直连解析，单独标记，不混进回执认领的正式解析。
+        receipt = receipts_by_rule.get(rule.rule_id)
         log = ParseLogEntry(
             record_id=f"PLOG-{job.job_id}-{i+1:04d}",
             source_url=url,
@@ -71,6 +76,12 @@ def run_crawl_pipeline(site_row: dict[str, Any], job_row: dict[str, Any],
             error_type="字段缺失" if raw.has_errors() else "",
             retry_count=1 if raw.has_errors() else 0,
             error_detail="; ".join(raw.errors) if raw.has_errors() else "",
+            rule_version=rule.rule_version,
+            release_receipt_id=receipt.receipt_id if receipt else "",
+            source_job_id=job.job_id,
+            field_schema=dict(rule.field_schema),
+            effective_at=receipt.effective_at if receipt else "",
+            parse_mode="正式解析" if receipt else "直接解析",
         )
         parse_logs.append(log)
         _persist_parse_log(log)
@@ -107,6 +118,19 @@ def run_crawl_pipeline(site_row: dict[str, Any], job_row: dict[str, Any],
     _persist_batch(batch)
 
     return batch
+
+
+def _release_receipts_for_rules(rules: list[ExtractRule]) -> dict[str, RuleReleaseReceipt]:
+    """为当前规则匹配已发布的回执，写日志时登记实际使用的版本。"""
+    mapping: dict[str, RuleReleaseReceipt] = {}
+    for rule in rules:
+        for receipt in release_flow.all_receipts():
+            if (receipt.rule_id == rule.rule_id
+                    and receipt.rule_version == rule.rule_version
+                    and receipt.status == release_flow.RELEASED):
+                mapping[rule.rule_id] = receipt
+                break
+    return mapping
 
 
 def _simulate_extract(url: str, rule: ExtractRule) -> RawExtractedContent:
@@ -587,21 +611,8 @@ def _persist_fingerprint(fp: UrlFingerprint) -> None:
 
 
 def _persist_parse_log(log: ParseLogEntry) -> None:
-    rows = store.rows("parse_log")
-    rows.append({
-        "id": max((int(row.get("id", 0)) for row in rows), default=0) + 1,
-        "记录编号": log.record_id,
-        "来源URL": log.source_url,
-        "解析规则": log.parse_rule_id,
-        "解析结果": log.parse_result,
-        "异常类型": log.error_type,
-        "重试次数": log.retry_count,
-        "错误详情": log.error_detail,
-        "记录时间": log.recorded_at,
-        "status": "成功" if not log.error_type else "格式异常",
-        "pending": False,
-        "abnormal": bool(log.error_type),
-    })
+    """解析日志统一走台账写入，保留规则版本、发布回执和字段口径。"""
+    release_flow._persist_parse_log(log)
 
 
 def _persist_delivery(dt: DeliveryTask) -> None:

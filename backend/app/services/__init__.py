@@ -24,6 +24,9 @@ from app.services.data_archive import DataArchiveService
 from app.services.diff_check import DiffCheckService
 from app.services.export_task import ExportTaskService
 from app.services.audit_log import AuditLogService
+from app.services.rule_release import RuleReleaseService
+from app.services.candidate_batch import CandidateBatchService
+from app.services.batch_acceptance import BatchAcceptanceService
 
 SERVICES: dict[str, BaseModuleService] = {
     "crawl_site": CrawlSiteService(),
@@ -48,6 +51,9 @@ SERVICES: dict[str, BaseModuleService] = {
     "diff_check": DiffCheckService(),
     "export_task": ExportTaskService(),
     "audit_log": AuditLogService(),
+    "rule_release": RuleReleaseService(),
+    "candidate_batch": CandidateBatchService(),
+    "batch_acceptance": BatchAcceptanceService(),
 }
 
 

@@ -21,6 +21,68 @@ def require_service(module: str):
     return service
 
 
+# 固定路径必须注册在 /{module}/{entry_id} 之前，否则会被动态段吞掉。
+def _as_at(value: Any) -> str | None:
+    """Query 默认值在直接调用处理函数时是对象，统一收敛成可选字符串。"""
+    return value if isinstance(value, str) and value.strip() else None
+
+
+@router.get("/rule-release/eligibility")
+def release_eligibility(
+    job_id: str | None = Query(default=None),
+    target_site: str | None = Query(default=None),
+    at: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """回执生效资格：切换前后按作业或站点查，每张回执给出生效判定。"""
+    from app import release_flow
+
+    items = release_flow.list_receipt_eligibility(
+        job_id=_as_at(job_id), target_site=_as_at(target_site), at=_as_at(at))
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/rule-release/jobs/{job_id}/inspect")
+def inspect_job_flow(
+    job_id: str,
+    at: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """查一个作业的版本资格、各版本解析日志和候选/验收明细。"""
+    from app import release_flow
+
+    return release_flow.inspect_job(job_id, at=_as_at(at))
+
+
+@router.post("/rule-release/jobs/{job_id}/parse")
+def parse_job_pages(
+    job_id: str,
+    payload: EntryPayload,
+    at: str | None = Query(default=None),
+) -> ActionResult:
+    """解析端按发布回执认领网页并登记实用规则版本，返回逐页结果。"""
+    from app import release_flow
+
+    values = payload.values
+    pages = [
+        part.strip() for part in str(values.get("页面", "")).split(",") if part.strip()
+    ]
+    try:
+        job = release_flow.job_from_store(job_id)
+        parsed, skipped = release_flow.parse_claimed_pages(
+            job, pages=pages or None, at=_as_at(at))
+    except release_flow.ReleaseFlowError as exc:
+        return ActionResult(ok=False, message=str(exc))
+    detail = {
+        "已解析": [
+            {"来源URL": log.source_url, "规则版本": log.rule_version,
+             "发布回执": log.release_receipt_id}
+            for log in parsed
+        ],
+        "跳过": [{"来源URL": url, "原因": reason} for url, reason in skipped],
+    }
+    message = f"已认领 {len(parsed)} 个页面，跳过 {len(skipped)} 个"
+    return ActionResult(ok=True, message=message, entry=detail)
+
+
 @router.get("/{module}", response_model=PageResult[dict])
 def list_entries(
     module: str,
@@ -85,9 +147,11 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
 @router.post("/{module}", response_model=ActionResult)
 def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)
-    entry, missing = service.create_entry(payload.values)
-    if missing:
-        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    entry, problems = service.create_entry(payload.values)
+    if problems:
+        if all(problem in service.REQUIRED_FIELDS for problem in problems):
+            return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(problems)}")
+        return ActionResult(ok=False, message=f"登记未通过业务校验：{'；'.join(problems)}")
     return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
 
 

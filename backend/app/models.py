@@ -75,6 +75,92 @@ class ArchiveFormat(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# 字段口径与时间辅助：种子行里的页面列表、字段口径和计数都可能是文本
+# ---------------------------------------------------------------------------
+
+def safe_int(value: Any, default: int = 0) -> int:
+    """种子数据里计数列可能是占位文本，解析失败时回退默认值。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_text_list(value: Any) -> list[str]:
+    """把“页面1,页面2”或列表统一成去空白后的字符串列表。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def parse_field_spec(value: str, default_type: str = "string") -> list[tuple[str, str]]:
+    """解析“title:string,body:object”形式的字段口径，返回 (字段名, 类型)。"""
+    specs: list[tuple[str, str]] = []
+    for part in str(value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, data_type = part.partition(":")
+        specs.append((name.strip(), data_type.strip() or default_type))
+    return specs
+
+
+def parse_schema(value: Any, default_type: str = "string") -> dict[str, str]:
+    """把 JSON / “字段:类型”文本 / 字典统一成字段口径映射。"""
+    if isinstance(value, dict):
+        return {str(name): str(data_type or default_type) for name, data_type in value.items()}
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    if text.startswith("{"):
+        try:
+            return parse_schema(json.loads(text), default_type)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {name: data_type for name, data_type in parse_field_spec(text, default_type)}
+
+
+def to_utc(value: Any) -> datetime:
+    """把时间文本转成带时区的 datetime，空值或非法值回退到最小值，便于比较。"""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    text = value.strip()
+    if not text:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def as_moment(value: Any = None) -> datetime:
+    """把可选的时刻参数归一化：None 或不可解析的值一律视为“当前时刻”。"""
+    if value is None or not isinstance(value, (str, datetime)):
+        return datetime.now(timezone.utc)
+    moment = to_utc(value)
+    if moment == datetime.min.replace(tzinfo=timezone.utc):
+        return datetime.now(timezone.utc)
+    return moment
+
+
+def schema_fingerprint(schema: dict[str, str]) -> str:
+    """字段口径指纹：字段名与类型都参与，顺序不敏感；口径不同则指纹不同。"""
+    payload = json.dumps(sorted((str(k), str(v)) for k, v in schema.items()), ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def merge_schema(schema: dict[str, str], other: dict[str, str]) -> dict[str, str]:
+    merged = dict(schema)
+    merged.update(other)
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # 跨模块数据类
 # ---------------------------------------------------------------------------
 
@@ -224,19 +310,34 @@ class ExtractRule:
     clean_regex: str = ""
     extract_order: int = 0
     status: str = "草稿"
+    rule_version: str = ""
+    effective_at: str = ""
+    field_schema: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> ExtractRule:
+        raw_mapping = str(row.get("字段映射", ""))
+        default_type = str(row.get("数据类型", "string") or "string")
         return cls(
             rule_id=str(row.get("规则编号", "")),
             target_site=str(row.get("目标站点", "")),
             xpath_selector=str(row.get("XPath选择器", "")),
-            field_mapping={"raw": str(row.get("字段映射", ""))},
-            data_type=str(row.get("数据类型", "string")),
+            field_mapping={"raw": raw_mapping},
+            data_type=default_type,
             clean_regex=str(row.get("清洗正则", "")),
-            extract_order=int(row.get("抽取顺序", 0)),
+            extract_order=safe_int(row.get("抽取顺序"), 0),
             status=str(row.get("status", "草稿")),
+            rule_version=str(row.get("版本号", "")),
+            effective_at=str(row.get("生效时间", "")),
+            field_schema=parse_schema(raw_mapping, default_type),
         )
+
+    def field_names(self) -> list[str]:
+        """字段口径里的字段名，保持配置顺序。"""
+        return list(self.field_schema)
+
+    def schema_fingerprint(self) -> str:
+        return schema_fingerprint(self.field_schema)
 
 
 @dataclass
@@ -314,7 +415,7 @@ class StorageBatch:
         return cls(
             batch_id=str(row.get("批次编号", "")),
             source_job_id=str(row.get("来源作业", "")),
-            row_count=int(row.get("数据行数", 0)),
+            row_count=safe_int(row.get("数据行数"), 0),
             storage_path=str(row.get("存储路径", "")),
             compression=str(row.get("压缩格式", "gzip")),
             schema_version=str(row.get("Schema版本", "v1")),
@@ -326,6 +427,14 @@ class StorageBatch:
     def compute_checksum(self) -> str:
         payload = json.dumps([r.fields for r in self.records], sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()
+
+    def field_schemas(self) -> set[str]:
+        """批次内各记录的字段口径指纹；不同版本规则抽出的页面不应混成一个批次。"""
+        return {schema_fingerprint({name: "string" for name in record.fields})
+                for record in self.records}
+
+    def is_schema_consistent(self) -> bool:
+        return len(self.field_schemas()) <= 1
 
 
 @dataclass
@@ -520,7 +629,11 @@ class CrawlLimitRule:
 
 @dataclass
 class ParseLogEntry:
-    """解析日志记录：parse_log 管理，记录每次抽取的解析结果。"""
+    """解析日志记录：parse_log 管理，记录每次抽取的解析结果。
+
+    解析日志是台账：一旦写入不随规则切换而改写，规则版本、发布回执和字段
+    口径都按当时实际使用的值留痕，切换前后都能按版本查询。
+    """
     record_id: str
     source_url: str
     parse_rule_id: str
@@ -529,6 +642,12 @@ class ParseLogEntry:
     retry_count: int = 0
     error_detail: str = ""
     recorded_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    rule_version: str = ""
+    release_receipt_id: str = ""
+    source_job_id: str = ""
+    field_schema: dict[str, str] = field(default_factory=dict)
+    effective_at: str = ""
+    parse_mode: str = "正式解析"
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> ParseLogEntry:
@@ -538,10 +657,122 @@ class ParseLogEntry:
             parse_rule_id=str(row.get("解析规则", "")),
             parse_result=str(row.get("解析结果", "")),
             error_type=str(row.get("异常类型", "")),
-            retry_count=int(row.get("重试次数", 0)),
+            retry_count=safe_int(row.get("重试次数"), 0),
             error_detail=str(row.get("错误详情", "")),
             recorded_at=str(row.get("记录时间", "")),
+            rule_version=str(row.get("规则版本", "")),
+            release_receipt_id=str(row.get("发布回执", "")),
+            source_job_id=str(row.get("来源作业", "")),
+            field_schema=parse_schema(row.get("字段口径", ""), "string"),
+            effective_at=str(row.get("生效时间", "")),
+            parse_mode=str(row.get("解析方式", "正式解析")),
         )
+
+    def schema_fingerprint(self) -> str:
+        return schema_fingerprint(self.field_schema)
+
+
+@dataclass
+class RuleReleaseReceipt:
+    """规则发布回执：content_extract 规则进入实际解析前必须补齐的发布阶段。
+
+    一份回执锁定一个规则版本在某个站点上的字段口径：
+    - 试跑阶段只处理试跑页面，产出解析日志但不进入交付批次；
+    - 试跑通过后进入待发布，等待发布结论；
+    - 发布后记录生效时间，解析端据此认领网页并登记实用版本；
+    - 试跑失败/中断仍可恢复审核，不丢已发生的解析记录。
+    """
+    receipt_id: str
+    rule_id: str
+    rule_version: str
+    target_site: str
+    field_schema: dict[str, str] = field(default_factory=dict)
+    job_id: str = ""
+    trial_pages: list[str] = field(default_factory=list)
+    claimed_pages: list[str] = field(default_factory=list)
+    trial_passed: int = 0
+    trial_failed: int = 0
+    status: str = "试跑中"
+    effective_at: str = ""
+    released_at: str = ""
+    interrupted_reason: str = ""
+    conclusion: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @classmethod
+    def from_seed_row(cls, row: dict[str, Any]) -> RuleReleaseReceipt:
+        return cls(
+            receipt_id=str(row.get("回执编号", "")),
+            rule_id=str(row.get("规则编号", "")),
+            rule_version=str(row.get("规则版本", "")),
+            target_site=str(row.get("目标站点", "")),
+            field_schema=parse_schema(row.get("字段口径", ""), "string"),
+            job_id=str(row.get("来源作业", "")),
+            trial_pages=parse_text_list(row.get("试跑页面", "")),
+            claimed_pages=parse_text_list(row.get("认领页面", "")),
+            trial_passed=safe_int(row.get("试跑通过", 0), 0),
+            trial_failed=safe_int(row.get("试跑失败", 0), 0),
+            status=str(row.get("status", "试跑中")),
+            effective_at=str(row.get("生效时间", "")),
+            released_at=str(row.get("发布时间", "")),
+            interrupted_reason=str(row.get("中断原因", "")),
+            conclusion=str(row.get("发布结论", "")),
+            created_at=str(row.get("创建时间", "")),
+        )
+
+    def schema_fingerprint(self) -> str:
+        return schema_fingerprint(self.field_schema)
+
+    def trial_finished(self) -> bool:
+        return bool(self.trial_pages) and self.trial_passed + self.trial_failed >= len(self.trial_pages)
+
+    def is_effective(self, at: Any = None) -> bool:
+        """只有已发布且已到生效时间的回执才允许进入实际解析。
+
+        `at` 为空表示当前时刻；显式传入历史时刻用于回查切换前后的资格。
+        """
+        if self.status != "已发布":
+            return False
+        effective = to_utc(self.effective_at or self.released_at)
+        if effective == datetime.min.replace(tzinfo=timezone.utc):
+            return False
+        return effective <= as_moment(at)
+
+    def can_enter_parsing(self, at: Any = None) -> bool:
+        return self.is_effective(at)
+
+
+@dataclass
+class CandidateBatch:
+    """候选结果批：把解析日志按来源作业聚合成待验收批，不直接产出交付凭据。"""
+    candidate_id: str
+    job_id: str
+    source_urls: list[str] = field(default_factory=list)
+    rule_versions: list[str] = field(default_factory=list)
+    field_schema: dict[str, str] = field(default_factory=dict)
+    schema_fingerprints: list[str] = field(default_factory=list)
+    status: str = "待验收"
+    deliverable: bool = False
+    rejection_reason: str = ""
+    groups: list[dict[str, Any]] = field(default_factory=list)
+
+    def is_deliverable(self) -> bool:
+        return self.deliverable and self.status == "验收通过"
+
+
+@dataclass
+class BatchAcceptance:
+    """批次验收结论：核对日志口径能否一起交付，通过后才签发可交付凭据。"""
+    acceptance_id: str
+    candidate_id: str
+    job_id: str
+    deliverable: bool
+    reason: str
+    schema_fingerprints: list[str] = field(default_factory=list)
+    rule_versions: list[str] = field(default_factory=list)
+    row_count: int = 0
+    credential: str = ""
+    checked_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
